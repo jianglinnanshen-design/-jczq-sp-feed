@@ -1,0 +1,363 @@
+name: Sporttery SP Cloud Feed
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 北京时间 08:00-17:59 每30分钟；18:00-07:59 每15分钟
+    - cron: '*/30 0-9 * * *'
+    - cron: '*/15 10-23 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sporttery-sp-cloud
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch official Sporttery SP
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import hashlib
+          import urllib.request
+          import urllib.parse
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+
+          root = Path("data/cloud_sp")
+          root.mkdir(parents=True, exist_ok=True)
+
+          url = (
+              "https://webapi.sporttery.cn/"
+              "gateway/uniform/football/getMatchCalculatorV1.qry"
+          )
+
+          pools = ["hhad,had", "crs", "ttg", "hafu"]
+
+          headers = {
+              "User-Agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 Chrome/140 Safari/537.36",
+              "Accept": "application/json, text/plain, */*",
+              "Referer":
+                  "https://www.sporttery.cn/jc/jsq/zqspf/index.html",
+          }
+
+          matches = {}
+          raw_parts = []
+
+          for pool in pools:
+              query = urllib.parse.urlencode({
+                  "channel": "c",
+                  "poolCode": pool,
+              })
+
+              req = urllib.request.Request(
+                  url + "?" + query,
+                  headers=headers,
+              )
+
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  raw = r.read()
+
+              raw_parts.append(raw)
+
+              payload = json.loads(raw.decode("utf-8"))
+
+              if not payload.get("success"):
+                  raise RuntimeError(
+                      f"Official API failed: {pool}"
+                  )
+
+              groups = (
+                  (payload.get("value") or {})
+                  .get("matchInfoList") or []
+              )
+
+              for group in groups:
+                  for m in group.get("subMatchList") or []:
+                      mid = str(m.get("matchId") or "")
+
+                      if not mid:
+                          continue
+
+                      dst = matches.setdefault(mid, {})
+
+                      metadata = [
+                          "matchId",
+                          "matchNum",
+                          "matchNumStr",
+                          "matchWeek",
+                          "businessDate",
+                          "matchDate",
+                          "matchTime",
+                          "leagueAbbName",
+                          "leagueAllName",
+                          "homeTeamAbbName",
+                          "homeTeamAllName",
+                          "awayTeamAbbName",
+                          "awayTeamAllName",
+                          "sellStatus",
+                          "matchStatus",
+                      ]
+
+                      for key in metadata:
+                          value = m.get(key)
+                          if value not in (None, ""):
+                              dst[key] = value
+
+                      for market in [
+                          "had",
+                          "hhad",
+                          "crs",
+                          "ttg",
+                          "hafu",
+                      ]:
+                          value = m.get(market)
+
+                          if isinstance(value, dict) and value:
+                              dst[market] = value
+
+          if not matches:
+              raise RuntimeError(
+                  "Official API returned no matches. "
+                  "Old feed is kept unchanged."
+              )
+
+          now = datetime.now(timezone.utc)
+          china_now = now.astimezone(
+              ZoneInfo("Asia/Shanghai")
+          )
+
+          raw_sha = hashlib.sha256(
+              b"\n".join(raw_parts)
+          ).hexdigest()
+
+          markets = {
+              mid: {
+                  k: matches[mid].get(k, {})
+                  for k in [
+                      "had",
+                      "hhad",
+                      "crs",
+                      "ttg",
+                      "hafu",
+                  ]
+              }
+              for mid in sorted(matches)
+          }
+
+          fingerprint = hashlib.sha256(
+              json.dumps(
+                  markets,
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ).encode("utf-8")
+          ).hexdigest()
+
+          latest_path = root / "latest.json"
+
+          previous = {}
+
+          if latest_path.exists():
+              try:
+                  previous = json.loads(
+                      latest_path.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+              except Exception:
+                  previous = {}
+
+          changed = (
+              previous.get("market_fingerprint")
+              != fingerprint
+          )
+
+          heartbeat = True
+
+          if previous.get("observed_at"):
+              try:
+                  old = datetime.fromisoformat(
+                      previous["observed_at"]
+                      .replace("Z", "+00:00")
+                  )
+
+                  heartbeat = (
+                      now - old
+                  ).total_seconds() >= 3600
+
+              except Exception:
+                  pass
+
+          if not changed and not heartbeat:
+              print("No SP change; no commit needed.")
+              raise SystemExit(0)
+
+          doc = {
+              "schema":
+                  "jczq.sporttery.cloud-feed.v1",
+
+              "source":
+                  "sporttery_official_api",
+
+              "official": True,
+
+              "observed_at":
+                  now.isoformat()
+                  .replace("+00:00", "Z"),
+
+              "observed_at_cst":
+                  china_now.isoformat(),
+
+              "raw_sha256":
+                  raw_sha,
+
+              "market_fingerprint":
+                  fingerprint,
+
+              "match_count":
+                  len(matches),
+
+              "matches": [
+                  matches[mid]
+                  for mid in sorted(matches)
+              ],
+          }
+
+          latest_path.write_text(
+              json.dumps(
+                  doc,
+                  ensure_ascii=False,
+                  indent=2,
+              ) + "\n",
+              encoding="utf-8",
+          )
+
+          business_dates = sorted({
+              str(m.get("businessDate"))
+              for m in matches.values()
+              if m.get("businessDate")
+          })
+
+          business_date = (
+              business_dates[-1]
+              if business_dates
+              else china_now.date().isoformat()
+          )
+
+          history_dir = (
+              root / "history" / business_date
+          )
+
+          history_dir.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          timestamp = (
+              china_now
+              .strftime("%Y%m%d-%H%M%S")
+          )
+
+          if changed:
+              snapshot = (
+                  history_dir
+                  / f"{timestamp}.json"
+              )
+
+              snapshot.write_text(
+                  json.dumps(
+                      doc,
+                      ensure_ascii=False,
+                      indent=2,
+                  ) + "\n",
+                  encoding="utf-8",
+              )
+
+          timeline = (
+              root / "timeline"
+              / f"{business_date}.jsonl"
+          )
+
+          timeline.parent.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          with timeline.open(
+              "a",
+              encoding="utf-8",
+          ) as f:
+              f.write(json.dumps({
+                  "observed_at":
+                      doc["observed_at"],
+
+                  "observed_at_cst":
+                      doc["observed_at_cst"],
+
+                  "market_fingerprint":
+                      fingerprint,
+
+                  "raw_sha256":
+                      raw_sha,
+
+                  "match_count":
+                      len(matches),
+
+                  "changed":
+                      changed,
+
+              }, ensure_ascii=False)
+              + "\n")
+
+          print(
+              f"Captured {len(matches)} "
+              f"official matches; "
+              f"changed={changed}"
+          )
+          PY
+
+      - name: Commit official SP feed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name \
+            "github-actions[bot]"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/cloud_sp
+
+          if git diff --cached --quiet; then
+            echo "Nothing new to commit."
+            exit 0
+          fi
+
+          git commit \
+            -m "data: update official Sporttery SP"
+
+          git pull --rebase \
+            origin "$GITHUB_REF_NAME"
+
+          git push \
+            origin "HEAD:$GITHUB_REF_NAME"
