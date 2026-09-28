@@ -33,7 +33,7 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Fetch official Sporttery SP with Chromium
+      - name: Fetch official Sporttery SP in browser context
         shell: bash
         run: |
           python - <<'PY'
@@ -48,218 +48,571 @@ jobs:
           ROOT = Path("data/cloud_sp")
           ROOT.mkdir(parents=True, exist_ok=True)
 
-          PAGES = [
-              "https://www.sporttery.cn/jc/jsq/zqspf/index.html",
-              "https://www.sporttery.cn/jc/jsq/zqbf/index.html",
-              "https://www.sporttery.cn/jc/jsq/zqzjqs/index.html",
-              "https://www.sporttery.cn/jc/jsq/zqbqc/index.html",
+          ORIGIN_PAGE = "https://www.sporttery.cn/"
+
+          API_BASES = [
+              "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry",
+              "https://webapi.sporttery.cn/gateway/jc/football/getMatchCalculatorV1.qry",
           ]
 
-          API_TOKEN = "getMatchCalculatorV1.qry"
-          TARGET_POOLS = {"had", "hhad", "crs", "ttg", "hafu"}
+          POOLS = ["hhad,had", "crs", "ttg", "hafu"]
+          MARKETS = {"had", "hhad", "crs", "ttg", "hafu"}
+
           captured = []
           raw_bodies = []
-
-          def merge_match(dst, src):
-              metadata = [
-                  "matchId", "matchNum", "matchNumStr", "matchWeek",
-                  "businessDate", "matchDate", "matchTime",
-                  "leagueAbbName", "leagueAllName",
-                  "homeTeamAbbName", "homeTeamAllName",
-                  "awayTeamAbbName", "awayTeamAllName",
-                  "sellStatus", "matchStatus",
-              ]
-              for key in metadata:
-                  value = src.get(key)
-                  if value not in (None, ""):
-                      dst[key] = value
-              for market in TARGET_POOLS:
-                  value = src.get(market)
-                  if isinstance(value, dict) and value:
-                      dst[market] = value
 
           async def main():
               async with async_playwright() as p:
                   browser = await p.chromium.launch(
                       headless=True,
-                      args=["--no-sandbox", "--disable-dev-shm-usage"],
+                      args=[
+                          "--no-sandbox",
+                          "--disable-dev-shm-usage",
+                      ],
                   )
+
                   context = await browser.new_context(
                       locale="zh-CN",
                       timezone_id="Asia/Shanghai",
-                      viewport={"width": 1440, "height": 1000},
-                      user_agent=(
-                          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/140.0.0.0 Safari/537.36"
-                      ),
+                      viewport={
+                          "width": 1440,
+                          "height": 1000,
+                      },
                   )
+
                   page = await context.new_page()
 
-                  async def on_response(response):
-                      if API_TOKEN not in response.url:
-                          return
-                      if response.status != 200:
-                          print("API response status:", response.status, response.url)
-                          return
-                      try:
-                          text = await response.text()
-                          payload = json.loads(text)
-                      except Exception as exc:
-                          print("Failed to parse API response:", exc)
-                          return
-                      if not payload.get("success"):
-                          print("Official API returned success=false")
-                          return
-                      raw_bodies.append(text.encode("utf-8"))
-                      captured.append({"url": response.url, "payload": payload})
-                      print("Captured:", response.url)
+                  print(
+                      "Chromium UA:",
+                      await page.evaluate(
+                          "navigator.userAgent"
+                      ),
+                  )
 
-                  page.on("response", on_response)
+                  try:
+                      response = await page.goto(
+                          ORIGIN_PAGE,
+                          wait_until="domcontentloaded",
+                          timeout=45000,
+                      )
 
-                  for url in PAGES:
-                      print("Opening:", url)
-                      try:
-                          await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                          await page.wait_for_timeout(7000)
-                      except Exception as exc:
-                          print("Page load warning:", url, exc)
+                      print(
+                          "Origin page status:",
+                          response.status
+                          if response
+                          else "NO_RESPONSE",
+                      )
+
+                  except Exception as exc:
+                      print(
+                          "Origin page load warning:",
+                          repr(exc),
+                      )
 
                   await page.wait_for_timeout(3000)
+
+                  for pool in POOLS:
+                      success = False
+
+                      for api_base in API_BASES:
+                          api_url = (
+                              f"{api_base}"
+                              f"?channel=c"
+                              f"&poolCode={pool}"
+                          )
+
+                          print(
+                              "Browser fetch:",
+                              api_url,
+                          )
+
+                          result = await page.evaluate(
+                              """
+                              async (url) => {
+                                try {
+                                  const r = await fetch(
+                                    url,
+                                    {
+                                      method: "GET",
+                                      mode: "cors",
+                                      credentials: "include",
+                                      cache: "no-store",
+                                      headers: {
+                                        "Accept":
+                                          "application/json, text/javascript, */*; q=0.01"
+                                      }
+                                    }
+                                  );
+
+                                  const text =
+                                    await r.text();
+
+                                  return {
+                                    ok: r.ok,
+                                    status: r.status,
+                                    statusText:
+                                      r.statusText,
+                                    url: r.url,
+                                    text
+                                  };
+
+                                } catch (e) {
+                                  return {
+                                    ok: false,
+                                    status: -1,
+                                    statusText:
+                                      String(e),
+                                    url,
+                                    text: ""
+                                  };
+                                }
+                              }
+                              """,
+                              api_url,
+                          )
+
+                          print(
+                              f"pool={pool} "
+                              f"status={result['status']} "
+                              f"ok={result['ok']} "
+                              f"url={result['url']}"
+                          )
+
+                          if result["status"] != 200:
+                              body_preview = (
+                                  result.get("text")
+                                  or ""
+                              )[:800]
+
+                              print(
+                                  "Non-200 body preview:",
+                                  body_preview,
+                              )
+                              continue
+
+                          text = (
+                              result.get("text")
+                              or ""
+                          )
+
+                          try:
+                              payload = json.loads(text)
+
+                          except Exception as exc:
+                              print(
+                                  "JSON parse error:",
+                                  repr(exc),
+                              )
+                              print(
+                                  "Body preview:",
+                                  text[:800],
+                              )
+                              continue
+
+                          if not payload.get("success"):
+                              print(
+                                  "Official API "
+                                  "success=false:",
+                                  payload.get(
+                                      "errorCode"
+                                  ),
+                                  payload.get(
+                                      "errorMessage"
+                                  ),
+                              )
+                              continue
+
+                          captured.append({
+                              "pool": pool,
+                              "url":
+                                  result["url"],
+                              "payload":
+                                  payload,
+                          })
+
+                          raw_bodies.append(
+                              text.encode("utf-8")
+                          )
+
+                          success = True
+                          break
+
+                      if not success:
+                          raise RuntimeError(
+                              "Official Sporttery "
+                              f"API failed for "
+                              f"pool={pool}. "
+                              "See status/body "
+                              "logs above."
+                          )
+
                   await browser.close()
 
           asyncio.run(main())
 
-          if not captured:
+          if len(captured) != len(POOLS):
               raise RuntimeError(
-                  "No official getMatchCalculatorV1.qry responses were captured."
+                  f"Expected {len(POOLS)} "
+                  "official pool responses, "
+                  f"captured {len(captured)}."
               )
 
           matches = {}
+
+          def merge_match(dst, src):
+              metadata = [
+                  "matchId",
+                  "matchNum",
+                  "matchNumStr",
+                  "matchWeek",
+                  "businessDate",
+                  "matchDate",
+                  "matchTime",
+                  "leagueAbbName",
+                  "leagueAllName",
+                  "homeTeamAbbName",
+                  "homeTeamAllName",
+                  "awayTeamAbbName",
+                  "awayTeamAllName",
+                  "sellStatus",
+                  "matchStatus",
+              ]
+
+              for key in metadata:
+                  value = src.get(key)
+
+                  if value not in (
+                      None,
+                      "",
+                  ):
+                      dst[key] = value
+
+              for market in MARKETS:
+                  value = src.get(market)
+
+                  if (
+                      isinstance(
+                          value,
+                          dict,
+                      )
+                      and value
+                  ):
+                      dst[market] = value
+
           for item in captured:
               payload = item["payload"]
-              groups = ((payload.get("value") or {}).get("matchInfoList") or [])
+
+              groups = (
+                  (
+                      payload.get("value")
+                      or {}
+                  )
+                  .get("matchInfoList")
+                  or []
+              )
+
               for group in groups:
-                  for m in group.get("subMatchList") or []:
-                      mid = str(m.get("matchId") or "")
+                  for m in (
+                      group.get(
+                          "subMatchList"
+                      )
+                      or []
+                  ):
+                      mid = str(
+                          m.get("matchId")
+                          or ""
+                      )
+
                       if not mid:
                           continue
-                      dst = matches.setdefault(mid, {})
-                      merge_match(dst, m)
+
+                      dst = matches.setdefault(
+                          mid,
+                          {},
+                      )
+
+                      merge_match(
+                          dst,
+                          m,
+                      )
 
           if not matches:
               raise RuntimeError(
-                  "Official responses were captured but no matches were parsed."
+                  "Official responses were "
+                  "successful but no matches "
+                  "were parsed."
               )
 
-          now = datetime.now(timezone.utc)
-          china_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
-          raw_sha = hashlib.sha256(b"\n".join(raw_bodies)).hexdigest()
+          now = datetime.now(
+              timezone.utc
+          )
+
+          china_now = now.astimezone(
+              ZoneInfo("Asia/Shanghai")
+          )
+
+          raw_sha = hashlib.sha256(
+              b"\n".join(raw_bodies)
+          ).hexdigest()
 
           markets_only = {
               mid: {
-                  market: matches[mid].get(market, {})
-                  for market in sorted(TARGET_POOLS)
+                  market:
+                      matches[mid].get(
+                          market,
+                          {},
+                      )
+                  for market
+                  in sorted(MARKETS)
               }
               for mid in sorted(matches)
           }
 
-          fingerprint = hashlib.sha256(
-              json.dumps(
-                  markets_only,
-                  ensure_ascii=False,
-                  sort_keys=True,
-                  separators=(",", ":"),
-              ).encode("utf-8")
-          ).hexdigest()
-
-          latest_path = ROOT / "latest.json"
-          previous = {}
-          if latest_path.exists():
-              try:
-                  previous = json.loads(latest_path.read_text(encoding="utf-8"))
-              except Exception:
-                  previous = {}
-
-          changed = previous.get("market_fingerprint") != fingerprint
-          heartbeat_due = True
-          if previous.get("observed_at"):
-              try:
-                  old = datetime.fromisoformat(
-                      previous["observed_at"].replace("Z", "+00:00")
-                  )
-                  heartbeat_due = (now - old).total_seconds() >= 3600
-              except Exception:
-                  pass
-
-          if not changed and not heartbeat_due:
-              print("No SP change and no hourly heartbeat needed.")
-              raise SystemExit(0)
+          fingerprint = (
+              hashlib.sha256(
+                  json.dumps(
+                      markets_only,
+                      ensure_ascii=False,
+                      sort_keys=True,
+                      separators=(
+                          ",",
+                          ":",
+                      ),
+                  ).encode("utf-8")
+              )
+              .hexdigest()
+          )
 
           market_coverage = {
               market: sum(
-                  1 for m in matches.values()
-                  if isinstance(m.get(market), dict) and m.get(market)
+                  1
+                  for m
+                  in matches.values()
+                  if isinstance(
+                      m.get(market),
+                      dict,
+                  )
+                  and m.get(market)
               )
-              for market in sorted(TARGET_POOLS)
+              for market
+              in sorted(MARKETS)
           }
 
+          latest_path = (
+              ROOT / "latest.json"
+          )
+
+          previous = {}
+
+          if latest_path.exists():
+              try:
+                  previous = json.loads(
+                      latest_path.read_text(
+                          encoding="utf-8"
+                      )
+                  )
+              except Exception:
+                  previous = {}
+
+          changed = (
+              previous.get(
+                  "market_fingerprint"
+              )
+              != fingerprint
+          )
+
+          heartbeat_due = True
+
+          if previous.get(
+              "observed_at"
+          ):
+              try:
+                  old = (
+                      datetime.fromisoformat(
+                          previous[
+                              "observed_at"
+                          ].replace(
+                              "Z",
+                              "+00:00",
+                          )
+                      )
+                  )
+
+                  heartbeat_due = (
+                      now - old
+                  ).total_seconds() >= 3600
+
+              except Exception:
+                  pass
+
+          if (
+              not changed
+              and not heartbeat_due
+          ):
+              print(
+                  "No SP change and "
+                  "no heartbeat needed."
+              )
+              raise SystemExit(0)
+
           doc = {
-              "schema": "jczq.sporttery.cloud-feed.v2",
-              "source": "sporttery_official_chromium",
+              "schema":
+                  "jczq.sporttery."
+                  "cloud-feed.v3",
+
+              "source":
+                  "sporttery_official_"
+                  "browser_fetch",
+
               "official": True,
-              "observed_at": now.isoformat().replace("+00:00", "Z"),
-              "observed_at_cst": china_now.isoformat(),
-              "raw_sha256": raw_sha,
-              "market_fingerprint": fingerprint,
-              "match_count": len(matches),
-              "market_coverage": market_coverage,
-              "matches": [matches[mid] for mid in sorted(matches)],
+
+              "observed_at":
+                  now.isoformat()
+                  .replace(
+                      "+00:00",
+                      "Z",
+                  ),
+
+              "observed_at_cst":
+                  china_now.isoformat(),
+
+              "raw_sha256":
+                  raw_sha,
+
+              "market_fingerprint":
+                  fingerprint,
+
+              "match_count":
+                  len(matches),
+
+              "market_coverage":
+                  market_coverage,
+
+              "matches": [
+                  matches[mid]
+                  for mid
+                  in sorted(matches)
+              ],
           }
 
           latest_path.write_text(
-              json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
+              json.dumps(
+                  doc,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+              + "\n",
               encoding="utf-8",
           )
 
           business_dates = sorted({
-              str(m.get("businessDate"))
-              for m in matches.values()
-              if m.get("businessDate")
+              str(
+                  m.get(
+                      "businessDate"
+                  )
+              )
+              for m
+              in matches.values()
+              if m.get(
+                  "businessDate"
+              )
           })
+
           business_date = (
               business_dates[-1]
               if business_dates
-              else china_now.date().isoformat()
+              else china_now
+              .date()
+              .isoformat()
           )
 
-          history_dir = ROOT / "history" / business_date
-          history_dir.mkdir(parents=True, exist_ok=True)
+          history_dir = (
+              ROOT
+              / "history"
+              / business_date
+          )
+
+          history_dir.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
 
           if changed:
-              stamp = china_now.strftime("%Y%m%d-%H%M%S")
-              snapshot_path = history_dir / f"{stamp}.json"
-              snapshot_path.write_text(
-                  json.dumps(doc, ensure_ascii=False, indent=2) + "\n",
+              stamp = (
+                  china_now.strftime(
+                      "%Y%m%d-%H%M%S"
+                  )
+              )
+
+              (
+                  history_dir
+                  / f"{stamp}.json"
+              ).write_text(
+                  json.dumps(
+                      doc,
+                      ensure_ascii=False,
+                      indent=2,
+                  )
+                  + "\n",
                   encoding="utf-8",
               )
 
-          timeline_path = ROOT / "timeline" / f"{business_date}.jsonl"
-          timeline_path.parent.mkdir(parents=True, exist_ok=True)
-          with timeline_path.open("a", encoding="utf-8") as f:
-              f.write(json.dumps({
-                  "observed_at": doc["observed_at"],
-                  "observed_at_cst": doc["observed_at_cst"],
-                  "market_fingerprint": fingerprint,
-                  "raw_sha256": raw_sha,
-                  "match_count": len(matches),
-                  "market_coverage": market_coverage,
-                  "changed": changed,
-              }, ensure_ascii=False) + "\n")
+          timeline_path = (
+              ROOT
+              / "timeline"
+              / f"{business_date}.jsonl"
+          )
+
+          timeline_path.parent.mkdir(
+              parents=True,
+              exist_ok=True,
+          )
+
+          with timeline_path.open(
+              "a",
+              encoding="utf-8",
+          ) as f:
+              f.write(
+                  json.dumps(
+                      {
+                          "observed_at":
+                              doc[
+                                  "observed_at"
+                              ],
+
+                          "observed_at_cst":
+                              doc[
+                                  "observed_at_cst"
+                              ],
+
+                          "market_fingerprint":
+                              fingerprint,
+
+                          "raw_sha256":
+                              raw_sha,
+
+                          "match_count":
+                              len(matches),
+
+                          "market_coverage":
+                              market_coverage,
+
+                          "changed":
+                              changed,
+                      },
+                      ensure_ascii=False,
+                  )
+                  + "\n"
+              )
 
           print(
-              f"Captured {len(matches)} official matches; "
-              f"coverage={market_coverage}; changed={changed}"
+              "SUCCESS: "
+              f"{len(matches)} "
+              "official matches; "
+              f"coverage="
+              f"{market_coverage}; "
+              f"changed="
+              f"{changed}"
           )
           PY
 
@@ -267,16 +620,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git config \
+            user.name \
+            "github-actions[bot]"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add data/cloud_sp
 
-          if git diff --cached --quiet; then
-            echo "Nothing new to commit."
+          if git diff \
+            --cached \
+            --quiet
+          then
+            echo \
+              "Nothing new to commit."
             exit 0
           fi
 
-          git commit -m "data: update official Sporttery SP"
-          git pull --rebase origin "$GITHUB_REF_NAME"
-          git push origin "HEAD:$GITHUB_REF_NAME"
+          git commit \
+            -m \
+            "data: update official Sporttery SP"
+
+          git pull \
+            --rebase \
+            origin \
+            "$GITHUB_REF_NAME"
+
+          git push \
+            origin \
+            "HEAD:$GITHUB_REF_NAME"
